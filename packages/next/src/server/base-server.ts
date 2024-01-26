@@ -84,6 +84,7 @@ import {
   NEXT_RSC_UNION_QUERY,
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_DID_POSTPONE_HEADER,
+  NEXT_URL,
 } from '../client/components/app-router-headers'
 import type {
   MatchOptions,
@@ -129,6 +130,10 @@ import {
 import { PrefetchRSCPathnameNormalizer } from './future/normalizers/request/prefetch-rsc'
 import { NextDataPathnameNormalizer } from './future/normalizers/request/next-data'
 import { getIsServerAction } from './lib/server-action-request-meta'
+import { isInterceptionRouteAppPath } from './future/helpers/interception-routes'
+import { generateInterceptionRoutesRewrites } from '../lib/generate-interception-routes-rewrites'
+import { pathToRegexp } from 'next/dist/compiled/path-to-regexp'
+import { normalizeRouteRegex } from '../lib/load-custom-routes'
 
 export type FindComponentsResult = {
   components: LoadComponentsReturnType
@@ -2803,6 +2808,54 @@ export default abstract class Server<ServerOptions extends Options = Options> {
 
       if (cachedData.status) {
         res.statusCode = cachedData.status
+      }
+
+      if (isPrefetchRSCRequest && routeModule && this.appPathRoutes) {
+        // when prefetching interception routes, the prefetch cache key can vary based on Next-URL
+        // as multiple interception routes might resolve to the same URL but map to different components
+
+        // interception routes are implemented as beforeFiles rewrites
+
+        let interceptionRewrites: ManifestRewriteRoute[] = []
+
+        // TODO: Move these into separate handlers & cache them
+        // They need to be handled differently because dev doesn't have access to a routes manifest file
+        if (process.env.NODE_ENV === 'development') {
+          interceptionRewrites = generateInterceptionRoutesRewrites(
+            Object.keys(this.appPathRoutes || {}),
+            this.nextConfig.basePath
+          ).map((route) => {
+            // TODO: This should use buildCustomRoute
+            const compiled = pathToRegexp(route.source, [], {
+              strict: true,
+              sensitive: false,
+              delimiter: '/', // default is `/#?`, but Next does not pass query info
+            })
+
+            let source = compiled.source
+
+            const regex = normalizeRouteRegex(source)
+
+            return { ...route, regex }
+          })
+        } else {
+          interceptionRewrites =
+            this.getRoutesManifest()?.rewrites.beforeFiles.filter(
+              // interception rewrites only contain a single `has` entry to verify Next-URL
+              (r) => r.has?.[0].key === NEXT_URL
+            ) ?? []
+        }
+
+        const couldBeRewritten = interceptionRewrites.some((rewrite) => {
+          return new RegExp(rewrite.regex).test(routeModule.definition.pathname)
+        })
+
+        if (
+          couldBeRewritten ||
+          isInterceptionRouteAppPath(routeModule.definition.pathname)
+        ) {
+          res.setHeader('vary', `${RSC_VARY_HEADER}, ${NEXT_URL}`)
+        }
       }
 
       // Mark that the request did postpone if this is a data request.
